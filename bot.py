@@ -1,7 +1,26 @@
 import os
+import sys
 import logging
 import subprocess
 import tempfile
+
+# Устанавливаем ffmpeg если его нет
+def ensure_ffmpeg():
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("FFmpeg not found, installing...")
+        try:
+            subprocess.run(['apt-get', 'update', '-y'], check=True)
+            subprocess.run(['apt-get', 'install', '-y', 'ffmpeg'], check=True)
+            return True
+        except Exception as e:
+            print(f"Failed to install ffmpeg: {e}")
+            return False
+
+ensure_ffmpeg()
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -32,7 +51,6 @@ async def clean_and_send(client, message: Message, filename: str):
         output_path = os.path.join(tmpdir, "cleaned.mp4")
 
         try:
-            # Pyrogram скачивает через MTProto — работает с любыми видео
             await message.download(file_name=input_path)
 
             size = os.path.getsize(input_path)
@@ -50,7 +68,6 @@ async def clean_and_send(client, message: Message, filename: str):
             )
 
             if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                logger.info("Stream copy failed, re-encoding...")
                 result2 = subprocess.run(
                     ['ffmpeg', '-i', input_path, '-map_metadata', '-1',
                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
