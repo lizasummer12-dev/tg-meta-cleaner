@@ -2,52 +2,55 @@ import os
 import logging
 import subprocess
 import tempfile
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+
+app = Client("videoclean_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+@app.on_message(filters.command("start"))
+async def start(client, message: Message):
+    await message.reply(
         "👋 Привет! Я удаляю метаданные из видео.\n\n"
-        "📤 Просто отправь или перешли мне видео — я всё сделаю сам."
+        "📤 Просто отправь или перешли мне видео — любым способом.\n"
+        "Я верну его без GPS, модели устройства и даты съёмки."
     )
 
 
-async def clean_and_send(update, context, file_id, filename):
-    status_msg = await update.message.reply_text("⏳ Обрабатываю...")
+async def clean_and_send(client, message: Message, filename: str):
+    status_msg = await message.reply("⏳ Скачиваю видео...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.mp4")
         output_path = os.path.join(tmpdir, "cleaned.mp4")
 
         try:
-            await status_msg.edit_text("📥 Скачиваю...")
-            tg_file = await context.bot.get_file(file_id)
-            await tg_file.download_to_drive(input_path)
+            # Pyrogram скачивает через MTProto — работает с любыми видео
+            await message.download(file_name=input_path)
 
             size = os.path.getsize(input_path)
-            logger.info(f"Downloaded file size: {size} bytes")
+            logger.info(f"Downloaded: {size} bytes")
 
             if size == 0:
-                await status_msg.edit_text("❌ Не удалось скачать файл.")
+                await status_msg.edit("❌ Не удалось скачать файл.")
                 return
 
-            await status_msg.edit_text("🧹 Удаляю метаданные...")
+            await status_msg.edit("🧹 Удаляю метаданные...")
 
-            # Пробуем stream copy сначала
             result = subprocess.run(
                 ['ffmpeg', '-i', input_path, '-map_metadata', '-1', '-c', 'copy', '-y', output_path],
                 capture_output=True, text=True, timeout=180
             )
 
-            # Если не вышло — перекодируем
             if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                logger.info("Stream copy failed, trying re-encode...")
+                logger.info("Stream copy failed, re-encoding...")
                 result2 = subprocess.run(
                     ['ffmpeg', '-i', input_path, '-map_metadata', '-1',
                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
@@ -55,60 +58,38 @@ async def clean_and_send(update, context, file_id, filename):
                     capture_output=True, text=True, timeout=300
                 )
                 if result2.returncode != 0:
-                    logger.error(f"Re-encode failed: {result2.stderr[-500:]}")
-                    await status_msg.edit_text("❌ Не удалось обработать файл.")
+                    await status_msg.edit("❌ Ошибка при обработке файла.")
                     return
 
-            await status_msg.edit_text("📤 Отправляю...")
-            with open(output_path, 'rb') as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=filename,
-                    caption="✅ Готово! Метаданные удалены.\n🗑 GPS, устройство, дата — всё очищено."
-                )
+            await status_msg.edit("📤 Отправляю...")
+            await message.reply_document(
+                document=output_path,
+                file_name=filename,
+                caption="✅ Готово! Метаданные удалены.\n🗑 GPS, модель устройства, дата съёмки — всё очищено."
+            )
             await status_msg.delete()
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-            await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+            await status_msg.edit(f"❌ Ошибка: {str(e)[:200]}")
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    video = update.message.video
-    if video.file_size / (1024 * 1024) > 50:
-        await update.message.reply_text("❌ Файл больше 50 МБ — не могу обработать.")
-        return
-    await clean_and_send(update, context, video.file_id, "clean_video.mp4")
+@app.on_message(filters.video)
+async def handle_video(client, message: Message):
+    await clean_and_send(client, message, "clean_video.mp4")
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.mime_type or not doc.mime_type.startswith('video/'):
-        await update.message.reply_text("❌ Это не видео файл.")
-        return
-    if doc.file_size / (1024 * 1024) > 50:
-        await update.message.reply_text("❌ Файл больше 50 МБ.")
-        return
-    name = doc.file_name or "video.mp4"
-    await clean_and_send(update, context, doc.file_id, f"clean_{name}")
+@app.on_message(filters.document & filters.create(lambda _, __, m: m.document and m.document.mime_type and m.document.mime_type.startswith("video/")))
+async def handle_document(client, message: Message):
+    name = message.document.file_name or "video.mp4"
+    await clean_and_send(client, message, f"clean_{name}")
 
 
-async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    note = update.message.video_note
-    await clean_and_send(update, context, note.file_id, "clean_video.mp4")
+@app.on_message(filters.video_note)
+async def handle_video_note(client, message: Message):
+    await clean_and_send(client, message, "clean_video.mp4")
 
 
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан!")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.Document.VIDEO, handle_document))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
-    logger.info("Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    logger.info("Бот запущен на Pyrogram!")
+    app.run()
